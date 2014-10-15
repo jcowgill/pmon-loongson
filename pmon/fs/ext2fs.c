@@ -41,7 +41,7 @@ static int ReadFromIndexBlock(int , __u32 , __u32 , __u8 ** , size_t *, size_t *
 static inline ext2_dirent *ext2_next_entry(ext2_dirent *);
 static int ext2_entrycmp(char *, void *, int );
 static int ext2_get_inode(int , unsigned long , struct ext2_inode ** );
-static int   ext2_load_linux(int , int , const unsigned char *);
+static int   ext2_load_linux(int , int , const char *);
 static int   read_super_block(int , int);
 int ext2_open(int , const char * , int , int);
 int ext2_close(int);
@@ -252,100 +252,213 @@ out:
 	return err;
 }
 
+static int ext2_load_file_content(int fd,struct ext2_inode * inode,unsigned char * bh)
+{
+	return ext2_read_file(fd,bh,inode->i_size,0,inode);
+}
+
+/*
+ * Searches a directory for a given file
+ *  fd       = device to read from
+ *  inode    = inode of the directory
+ *  filename = file to search for
+ *  result   = dirent of the file (must be allocated by caller)
+ */
+static int ext2_search_dir(int fd, struct ext2_inode *inode, char *filename, ext2_dirent *result)
+{
+	unsigned pos = 0;
+	unsigned filename_len = strlen(filename);
+
+	while (pos < le32_to_cpu(inode->i_size)) {
+		// Read entry
+		if (ext2_read_file(fd, result, sizeof(ext2_dirent), pos, inode) == 0) {
+			printf("%s: could not read directory\n", __func__);
+			return -1;
+		}
+
+		// Test if file matches
+		if (result->name_len == filename_len &&
+			memcmp(result->name, filename, filename_len) == 0) {
+			return 0;
+		}
+
+		pos += le32_to_cpu(result->rec_len);
+	}
+
+	printf("%s: no such file or directory\n", __func__);
+	return -1;
+}
+
+/*
+ * Reads a symbolic link and returns its full path (returned path must be freed)
+ *  fd            = device to read from
+ *  symlink_inode = symbolic link inode
+ *  path          = path to append to the symlink
+ */
+static char* ext2_resolve_symlink(int fd, __u32 symlink_inode, char *path)
+{
+	struct ext2_inode *inode_data = NULL;
+	char *new_path = NULL;
+	unsigned path_len;
+
+	// Read the inode
+	if(ext2_get_inode(fd, symlink_inode, &inode_data)) {
+		printf("%s: could not read inode %d\n", __func__, symlink_inode);
+		return NULL;
+	}
+
+	// Fail on empty symlinks
+	if (inode_data->i_size == 0) {
+		printf("%s: empty symlink\n", __func__);
+		free(inode_data);
+		return NULL;
+	}
+
+	// Construct a new path with resolved symlink
+	path_len = strlen(path);
+	new_path = malloc(inode_data->i_size + path_len + 2);
+
+	new_path[inode_data->i_size + path_len + 1] = '\0';
+	new_path[inode_data->i_size] = '/';
+	memcpy(new_path + inode_data->i_size + 1, path, path_len);
+
+	// For symlinks less than 60 chars, data is stored in the inode rather than in data blocks
+	if (inode_data->i_size <= 60) {
+		memcpy(new_path, &inode_data->i_block, inode_data->i_size);
+	} else {
+		if (ext2_read_file(fd, new_path, inode_data->i_size, 0, inode_data) == 0) {
+			printf("%s: could not read data for inode %d\n", __func__, symlink_inode);
+			free(new_path);
+			free(inode_data);
+			return NULL;
+		}
+	}
+
+	free(inode_data);
+	return new_path;
+}
+
+/*
+ * Resolves a pathname calculating the inode from the given path
+ *  fd           = device to read from (superblock must have been read)
+ *  inode        = inode to use as a starting point (must be a directory)
+ *  path         = path to search for
+ *  result_inode = result placed here on success
+ */
+static int ext2_resolve_path(int fd, __u32 inode, char *path, struct ext2_inode *result_inode, unsigned symlink_depth)
+{
+	struct ext2_inode *inode_data;
+	ext2_dirent dirent;
+	char *next_path;
+
+	int symlink_recurse_result;
+	__u32 symlink_parent_inode;
+
+	// Ignore leading slashes
+	while (*path == '/')
+		path++;
+
+	// Forbid empty paths (ie opening a directory)
+	if (*path == '\0') {
+		printf("%s: is a directory\n", __func__);
+		return -1;
+	}
+
+	// Read the inode
+	if(ext2_get_inode(fd, inode, &inode_data)) {
+		printf("%s: could not read inode %d\n", __func__, inode);
+		return -1;
+	}
+
+	// Split path into current and next path components
+	next_path = strchr(path, '/');
+	if (next_path) {
+		*next_path = '\0';
+		next_path++;
+	} else {
+		// This is the last path component
+		next_path = "";
+	}
+
+	// Search for file in directory
+	if (ext2_search_dir(fd, inode_data, path, &dirent)) {
+		free(inode_data);
+		return -1;
+	}
+
+	free(inode_data);
+
+	switch (dirent.file_type) {
+	case EXT2_FT_REG_FILE:
+		// Trailing path must be empty
+		if (*next_path) {
+			printf("%s: not a directory\n", __func__);
+			return -1;
+		}
+
+		// Read final inode
+		if(ext2_get_inode(fd, dirent.inode, &inode_data)) {
+			printf("%s: could not read inode %d\n", __func__, inode);
+			return -1;
+		}
+
+		*result_inode = *inode_data;
+		free(inode_data);
+		return 0;
+
+	case EXT2_FT_DIR:
+		// Recuse
+		return ext2_resolve_path(fd, dirent.inode, next_path, result_inode, symlink_depth);
+
+	case EXT2_FT_SYMLINK:
+		// Give up if we're at depth > 10
+		if (symlink_depth > 10) {
+			printf("%s: too many symlinks\n", __func__);
+			return -1;
+		}
+
+		// Resolve full path of the symlink
+		next_path = ext2_resolve_symlink(fd, dirent.inode, next_path);
+		if (next_path == NULL)
+			return -1;
+
+		// Select which inode will be the parent directory
+		symlink_parent_inode = (*next_path == '/') ? EXT2_ROOT_INO : inode;
+
+		// Recurse, but we have to free next_path on return
+		symlink_recurse_result = ext2_resolve_path(fd, symlink_parent_inode, next_path, result_inode, symlink_depth + 1);
+		free(next_path);
+		return symlink_recurse_result;
+
+	default:
+		printf("%s: can't read special files\n", __func__);
+		return -1;
+	}
+}
+
 /*
  * load linux kernel from ext2 partition
  * return 0 if success,else -1
  */
 
-static int ext2_load_linux(int fd,int index, const unsigned char *path)
+static int ext2_load_linux(int fd,int index, const char *path)
 {
-	struct ext2_inode *ext2_raw_inode;
-	ext2_dirent *de;
-	unsigned char *bh;
-	int i;
-	unsigned int inode;
-	int find = 1;
-	unsigned char s[EXT2_NAME_LEN];
-	unsigned char pathname[EXT2_NAME_LEN], *pathnameptr;
-	unsigned char *directoryname;
-	int showdir, lookupdir;
+	char *path_mutable;
+	int result;
 
-	showdir = 0;
-	lookupdir = 0;
-	bh = 0;
-
-	if(read_super_block(fd,index))
+	// Read superblock
+	if(read_super_block(fd, index))
 		return -1;
 
-	if((path[0]==0) || (path[strlen(path)-1] == '/'))
-		lookupdir = 1;
+	// Copy path so it's mutable
+	path_mutable = malloc(strlen(path) + 1);
+	strcpy(path_mutable, path);
 
-	strncpy(pathname,path,sizeof(pathname));
-	pathnameptr = pathname;
-	for(inode = EXT2_ROOT_INO; find; ) {
-		for(i = 0; pathnameptr[i] && pathnameptr[i] != '/'; i++);
-
-		pathnameptr[i] = 0;
-
-		directoryname = (unsigned char *)pathnameptr;
-		pathnameptr = (unsigned char *)(pathnameptr + i + 1);
-
-		if(!strlen(directoryname) && lookupdir)
-			showdir = 1;
-		if(ext2_get_inode(fd, inode, &ext2_raw_inode)) {
-			printf("load EXT2_ROOT_INO error");
-			return -1;
-		}
-		if(!bh)
-			bh = (unsigned char *)malloc(sb_block_size + ext2_raw_inode->i_size);
-
-		if(!bh) {
-			printf("Error in allocting memory for file content!\n");
-			return -1;
-		}
-		if(ext2_read_file(fd, bh, ext2_raw_inode->i_size, 0,
-					ext2_raw_inode) != ext2_raw_inode->i_size)
-			return -1;
-		de = (ext2_dirent *)bh;
-		find = 0;
-
-		for ( ; ((unsigned char *) de < bh + ext2_raw_inode->i_size) &&
-				(de->rec_len > 0) && (de->name_len > 0); de = ext2_next_entry(de)) {
-			strncpy(s,de->name,de->name_len);
-			s[de->name_len]='\0';//*(de->name+de->name_len)='\0';
-#ifdef DEBUG_IDE
-			printf("entry:name=%s,inode=%d,rec_len=%d,name_len=%d,file_type=%d\n",s,de->inode,de->rec_len,de->name_len,de->file_type);
-#endif
-			if(showdir)
-				printf("%s%s",s,((de->file_type)&2)?"/ ":" ");
-
-			if (!ext2_entrycmp(directoryname, de->name, de->name_len)) {
-				if(de->file_type == EXT2_FT_REG_FILE) {
-					if (ext2_get_inode(fd, de->inode, &the_inode)) {
-						printf("load EXT2_ROOT_INO error");
-						free(bh);
-						return -1;
-					}
-					free(bh);
-					return 0;
-				}
-				find = 1;
-				inode = de->inode;
-				break;
-			}
-		}
-		if(!find) {
-			free(bh);
-			if(!lookupdir)
-				printf("Not find the file or directory!\n");
-			else
-				printf("\n");
-			return -1;
-		}
-	}
-	return -1;
+	// Resolve the path and store in "the_inode"
+	result = ext2_resolve_path(fd, EXT2_ROOT_INO, path_mutable, the_inode, 0);
+	free(path_mutable);
+	return result;
 }
-
 
 
 /*
