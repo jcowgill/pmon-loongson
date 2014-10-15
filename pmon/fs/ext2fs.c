@@ -156,20 +156,6 @@ static inline ext2_dirent *ext2_next_entry(ext2_dirent *p)
 	return (ext2_dirent *)((char*)p + le16_to_cpu(p->rec_len));
 }
 
-/* ext2 entry name is not null terminated,so we could not use strcmp
- * return 0 if the first 'len' characters of 'entry' match those of 's'
- */
-static int ext2_entrycmp(char * s,void * entry , int len)
-{
-	int i;
-	if (strlen(s) != len)
-		return -1;
-	for(i = 0; i < len; i++)
-		if(*(char *)(s + i) != *(char *)((char *)entry + i))
-			return -1;
-	return 0;
-}
-
 /*
  * allocated a ext2_inode, and filled with inode info pointed by ino
  * out: ext2_raw_inode_ptr
@@ -250,11 +236,6 @@ static int ext2_get_inode(int fd, unsigned long ino, struct ext2_inode **ext2_ra
 out:
 	free(bh);
 	return err;
-}
-
-static int ext2_load_file_content(int fd,struct ext2_inode * inode,unsigned char * bh)
-{
-	return ext2_read_file(fd,bh,inode->i_size,0,inode);
 }
 
 /*
